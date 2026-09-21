@@ -1,0 +1,44 @@
+# Python 缓存与本地开发环境
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+.vscode/
+.idea/
+
+# 运行产物、采集数据与训练结果
+*.log
+*.dmp
+logs/
+datasets/
+checkpoints/
+ckpts/
+outputs/
+output/
+runs/
+wandb/
+recordings/
+videos/
+*.hdf5
+*.safetensors
+*.pt
+*.pth
+*.bin
+*.tar
+*.tar.gz
+
+# 本机路径、密码与证书；env.example 和硬件示例正常上传
+local.env
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+/source/leisaac/leisaac/xtrainer_utils/utils/dobot_config/dobot_settings.ini
+/source/leisaac/leisaac/xtrainer_utils/utils/dobot_config/dobot_settings copy.ini
+
+# 系统杂文件与资产浏览缓存
+.DS_Store
+.thumbs/

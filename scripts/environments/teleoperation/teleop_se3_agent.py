@@ -1,0 +1,563 @@
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Script to run a leisaac teleoperation with leisaac manipulation environments."""
+
+"""Launch Isaac Sim Simulator first."""
+import multiprocessing
+if multiprocessing.get_start_method() != "spawn":
+    multiprocessing.set_start_method("spawn", force=True)
+import argparse
+
+'''
+python scripts/environments/teleoperation/teleop_se3_agent.py \
+    --task=LeIsaac-XTrainer-PickCube-v0 \
+    --teleop_device=xtrainer_vr \
+    --num_envs=1 \
+    --device=cuda \
+    --enable_cameras \
+    --multi_view
+
+
+python scripts/environments/teleoperation/teleop_se3_agent.py \
+    --task=LeIsaac-XTrainer-PickCube-v0 \
+    --teleop_device=xtrainerleader \
+    --num_envs=1 \
+    --device=cuda \
+    --enable_cameras \
+    --multi_view \
+    --left_disabled \
+    
+    --record \
+    --dataset_file=./datasets/lift_cube.hdf5
+    
+[-1.49 -0.05 -1.52  0.07  1.47  1.60  0.97  1.46 -0.05  1.62 -0.00 -1.36
+ -1.64  0.97]
+ 
+python scripts/environments/teleoperation/teleop_se3_agent.py \
+    --task=LeIsaac-XTrainer-PickCube-v0 \
+    --teleop_device=bi_keyboard \
+    --num_envs=1 \
+    --device=cuda \
+    --enable_cameras \
+    --multi_view
+    
+python scripts/environments/teleoperation/teleop_se3_agent.py \
+    --task=LeIsaac-SO101-LiftCube-v0 \
+    --teleop_device=keyboard \
+    --num_envs=1 \
+    --device=cuda \
+    --enable_cameras
+    
+    --record \
+    --dataset_file=./datasets/dataset.hdf5
+    
+
+python scripts/environments/teleoperation/replay.py --task=LeIsaac-XTrainer-PickOrange-v0 --num_envs=1 --device=cuda --enable_cameras --replay_mode=action --dataset_file=./datasets/dataset2.hdf5 --select_episodes 0 --task_type bi_keyboard
+'''
+
+# add argparse arguments
+parser = argparse.ArgumentParser(description="leisaac teleoperation for leisaac environments.")
+parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
+parser.add_argument("--teleop_device", type=str, default="keyboard", choices=['keyboard', 'so101leader', 'bi-so101leader', 'xtrainerleader', 'bi_keyboard', 'xtrainer_vr'], help="Device for interacting with environment")
+parser.add_argument("--port", type=str, default='/dev/ttyACM0', help="Port for the teleop device:so101leader, default is /dev/ttyACM0")
+parser.add_argument("--left_arm_port", type=str, default='/dev/ttyACM0', help="Port for the left teleop device:bi-so101leader, default is /dev/ttyACM0")
+parser.add_argument("--right_arm_port", type=str, default='/dev/ttyACM1', help="Port for the right teleop device:bi-so101leader, default is /dev/ttyACM1")
+parser.add_argument("--task", type=str, default=None, help="Name of the task.")
+parser.add_argument("--seed", type=int, default=None, help="Seed for the environment.")
+parser.add_argument("--sensitivity", type=float, default=1.0, help="Sensitivity factor.")
+parser.add_argument("--multi_view", action="store_true", help="whether to enable quality render mode.")
+parser.add_argument("--left_disabled", action="store_true", help="whether to enable quality render mode.")
+
+# recorder_parameter
+parser.add_argument("--record", action="store_true", help="whether to enable record function")
+parser.add_argument("--step_hz", type=int, default=30, help="Environment stepping rate in Hz.")
+parser.add_argument("--dataset_file", type=str, default="./datasets/dataset.hdf5", help="File path to export recorded demos.")
+parser.add_argument("--resume", action="store_true", help="whether to resume recording in the existing dataset file")
+parser.add_argument("--num_demos", type=int, default=0, help="Number of demonstrations to record. Set to 0 for infinite.")
+
+parser.add_argument("--recalibrate", action="store_true", help="recalibrate SO101-Leader or Bi-SO101Leader")
+parser.add_argument("--quality", action="store_true", help="whether to enable quality render mode.")
+parser.add_argument("--enable_visualization", action="store_true", help="Enable task1/task2/task3 detection visualization (zone + points).")
+
+import os
+import time
+import torch
+
+################################################################################
+############################### VR stereo vision ###############################
+import cv2
+import numpy as np
+
+image_queue = multiprocessing.Queue(maxsize=2)
+
+def run_flask_server(q, cert_path, key_path):
+    from flask import Flask, Response
+    from flask_cors import CORS
+    app = Flask(__name__)
+    CORS(app)
+
+    @app.route('/stereo_feed')
+    def stereo_feed():
+        def generate():
+            print("Web client connected to stream.")
+            while True:
+                try:
+                    frame_bytes = q.get(timeout=1.0)
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+                except Exception as e:
+                    continue
+        return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+    import logging
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)
+    
+    app.run(host='0.0.0.0', port=8444, threaded=True, use_reloader=False, ssl_context=(cert_path, key_path))
+################################################################################
+
+class RateLimiter:
+    """Convenience class for enforcing rates in loops."""
+
+    def __init__(self, hz):
+        """
+        Args:
+            hz (int): frequency to enforce
+        """
+        self.hz = hz
+        self.last_time = time.time()
+        self.sleep_duration = 1.0 / hz
+        self.render_period = min(0.0166, self.sleep_duration)
+
+    def sleep(self, env):
+        """Attempt to sleep at the specified rate in hz."""
+        next_wakeup_time = self.last_time + self.sleep_duration
+        while time.time() < next_wakeup_time:
+            time.sleep(self.render_period)
+            env.sim.render()
+
+        self.last_time = self.last_time + self.sleep_duration
+
+        # detect time jumping forwards (e.g. loop is too slow)
+        if self.last_time < time.time():
+            while self.last_time < time.time():
+                self.last_time += self.sleep_duration
+
+def main():  # noqa: C901
+    from isaaclab.app import AppLauncher
+    # append AppLauncher cli args
+    AppLauncher.add_app_launcher_args(parser)
+    # parse the arguments
+    args_cli = parser.parse_args()
+    app_launcher_args = vars(args_cli)
+
+    # launch omniverse app
+    app_launcher = AppLauncher(app_launcher_args)
+    simulation_app = app_launcher.app
+    
+    import gymnasium as gym
+    from isaaclab.envs import ManagerBasedRLEnv, DirectRLEnv
+    from isaaclab_tasks.utils import parse_env_cfg
+    from isaaclab.managers import TerminationTermCfg, DatasetExportMode
+    
+    import leisaac.tasks  # Can not be removed. See source/leisaac/leisaac/__init__.py for details.   
+
+    from leisaac.devices import Se3Keyboard, SO101Leader, BiSO101Leader, XTrainerLeader, BiKeyboard, XTrainerVR
+    from leisaac.enhance.managers import StreamingRecorderManager, EnhanceDatasetExportMode
+    from leisaac.utils.env_utils import dynamic_reset_gripper_effort_limit_sim
+
+    def manual_terminate(env: ManagerBasedRLEnv | DirectRLEnv, success: bool):
+        if hasattr(env, "termination_manager"):
+            if success:
+                env.termination_manager.set_term_cfg("success", TerminationTermCfg(func=lambda env: torch.ones(env.num_envs, dtype=torch.bool, device=env.device)))
+            else:
+                env.termination_manager.set_term_cfg("success", TerminationTermCfg(func=lambda env: torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)))
+            env.termination_manager.compute()
+        elif hasattr(env, "_get_dones"):
+            env.cfg.return_success_status = success
+
+    """Running lerobot teleoperation with leisaac manipulation environment."""
+    
+    # get directory path and file name (without extension) from cli arguments
+    output_dir = os.path.dirname(args_cli.dataset_file)
+    output_file_name = os.path.splitext(os.path.basename(args_cli.dataset_file))[0]
+    # create directory if it does not exist
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
+    env_cfg.use_teleop_device(args_cli.teleop_device)
+    env_cfg.seed = args_cli.seed if args_cli.seed is not None else int(time.time())
+    task_name = args_cli.task
+    if hasattr(env_cfg, "enable_visualization"):
+        env_cfg.enable_visualization = args_cli.enable_visualization
+    elif args_cli.enable_visualization and task_name in ("task1", "task2", "task3"):
+        setattr(env_cfg, "enable_visualization", True)
+
+    if args_cli.quality:
+        env_cfg.sim.render.antialiasing_mode = 'FXAA'
+        env_cfg.sim.render.rendering_mode = 'quality'
+
+    # precheck task and teleop device
+    if "BiArm" in task_name:
+        assert args_cli.teleop_device == "bi-so101leader", "only support bi-so101leader for bi-arm task"
+    is_direct_env = "Direct" in task_name
+    if is_direct_env:
+        assert args_cli.teleop_device in ["so101leader", "bi-so101leader"], "only support so101leader or bi-so101leader for direct task"
+    if "XTrainer" in task_name:
+        assert args_cli.teleop_device in ["xtrainerleader", "bi_keyboard", "xtrainer_vr"], "only support xtrainerleader, bi_keyboard or xtrainer_vr for xtrainer task"
+
+    # timeout and terminate preprocess
+    if is_direct_env:
+        env_cfg.never_time_out = True
+        env_cfg.manual_terminate = True
+    else:
+        # modify configuration
+        if hasattr(env_cfg.terminations, "time_out"):
+            env_cfg.terminations.time_out = None
+        if hasattr(env_cfg.terminations, "success") and task_name not in ("task1", "task2", "task3"):
+            env_cfg.terminations.success = None
+    # recorder preprocess & manual success terminate preprocess
+    if args_cli.record:
+        if args_cli.resume:
+            env_cfg.recorders.dataset_export_mode = EnhanceDatasetExportMode.EXPORT_ALL_RESUME
+            assert os.path.exists(args_cli.dataset_file), "the dataset file does not exist, please don't use '--resume' if you want to record a new dataset"
+        else:
+            env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_ALL
+            assert not os.path.exists(args_cli.dataset_file), "the dataset file already exists, please use '--resume' to resume recording"
+        env_cfg.recorders.dataset_export_dir_path = output_dir
+        env_cfg.recorders.dataset_filename = output_file_name
+        if is_direct_env:
+            env_cfg.return_success_status = False
+        else:
+            if not hasattr(env_cfg.terminations, "success"):
+                setattr(env_cfg.terminations, "success", None)
+            env_cfg.terminations.success = TerminationTermCfg(func=lambda env: torch.zeros(env.num_envs, dtype=torch.bool, device=env.device))
+    else:
+        env_cfg.recorders = None
+
+    # create environment
+    env: ManagerBasedRLEnv | DirectRLEnv = gym.make(task_name, cfg=env_cfg).unwrapped
+    # replace the original recorder manager with the streaming recorder manager
+    if args_cli.record:
+        del env.recorder_manager
+        env.recorder_manager = StreamingRecorderManager(env_cfg.recorders, env)
+        env.recorder_manager.flush_steps = 100
+        env.recorder_manager.compression = 'lzf'
+
+    print(f"--------------------------------------------------")
+    print(f"Physics dt: {env.physics_dt:.5f} s")
+    print(f"Decimation: {env.cfg.decimation}")
+    print(f"Control dt: {env.step_dt:.5f} s")
+    print(f"Expected FPS: {1.0/env.step_dt:.1f} Hz (must be the same as step_hz)")
+    print(f"--------------------------------------------------")
+
+    # create controller
+    if args_cli.teleop_device == "keyboard":
+        teleop_interface = Se3Keyboard(env, sensitivity=0.25 * args_cli.sensitivity)
+        args_cli.multi_view = False
+    elif args_cli.teleop_device == "so101leader":
+        teleop_interface = SO101Leader(env, port=args_cli.port, recalibrate=args_cli.recalibrate)
+        args_cli.multi_view = False
+    elif args_cli.teleop_device == "bi-so101leader":
+        teleop_interface = BiSO101Leader(env, left_port=args_cli.left_arm_port, right_port=args_cli.right_arm_port, recalibrate=args_cli.recalibrate)
+        args_cli.multi_view = False
+    elif args_cli.teleop_device == "xtrainerleader":
+        teleop_interface = XTrainerLeader(env, args_cli.left_disabled)
+    elif args_cli.teleop_device == "bi_keyboard":
+        teleop_interface = BiKeyboard(env, sensitivity=0.06 * args_cli.sensitivity)
+    elif args_cli.teleop_device == "xtrainer_vr":
+        teleop_interface = XTrainerVR(env, args_cli.left_disabled)
+    else:
+        raise ValueError(
+            f"Invalid device interface '{args_cli.teleop_device}'. Supported: 'keyboard', 'so101leader', 'bi-so101leader', 'xtrainerleader', 'bi_keyboard', 'xtrainer_vr'."
+        )
+
+    # add teleoperation key for env reset
+    should_reset_recording_instance = False
+
+    def reset_recording_instance():
+        nonlocal should_reset_recording_instance
+        should_reset_recording_instance = True
+
+    # add teleoperation key for task success
+    should_reset_task_success = False
+
+    def reset_task_success():
+        nonlocal should_reset_task_success
+        should_reset_task_success = True
+        reset_recording_instance()
+
+    teleop_interface.add_callback("R", reset_recording_instance)
+    teleop_interface.add_callback("N", reset_task_success)
+    print(teleop_interface)
+
+    rate_limiter = RateLimiter(args_cli.step_hz)
+
+    if args_cli.teleop_device == "xtrainer_vr":
+        package_root = os.path.dirname(leisaac.__file__)
+        XLEVR_PATH = os.path.join(package_root, "xtrainer_utils", "XLeVR")
+        cert_path = os.path.join(XLEVR_PATH, 'cert.pem')
+        key_path = os.path.join(XLEVR_PATH, 'key.pem')
+        if not os.path.exists(cert_path):
+            print(f"❌ Error: Certificate file not found {cert_path}")
+        
+        flask_process = multiprocessing.Process(
+            target=run_flask_server, 
+            args=(image_queue, cert_path, key_path), 
+            daemon=True
+        )
+        flask_process.start()
+        print(">>> Stereo Visual Streamer started as a SEPARATE PROCESS at http://[IP]:8444/stereo_feed")
+
+    # reset environment
+    if hasattr(env, "initialize"):
+        env.initialize()
+    env.reset()
+    teleop_interface.reset()
+    task_visualization_updater = None
+    if args_cli.enable_visualization and task_name == "task1":
+        try:
+            from leisaac.tasks.task1.mdp.observations import init_task1_visualization, update_task1_visualization
+            from leisaac.tasks.task1.xtrainer_pickup_recognition_env_cfg import (
+                TASK1_VISUALIZATION_PLATE_NAME,
+                TASK1_VISUALIZATION_OBJECT_NAMES,
+                TASK1_VISUALIZATION_X_RANGE,
+                TASK1_VISUALIZATION_Y_RANGE,
+                TASK1_VISUALIZATION_HEIGHT_RANGE,
+                TASK1_VISUALIZATION_OBJECT_OFFSETS,
+                TASK1_VISUALIZATION_OBJECT_REGIONS,
+                TASK1_OFFSET_FRAME,
+            )
+
+            init_task1_visualization(
+                env=env,
+                plate_name=TASK1_VISUALIZATION_PLATE_NAME,
+                object_names=TASK1_VISUALIZATION_OBJECT_NAMES,
+                x_range=TASK1_VISUALIZATION_X_RANGE,
+                y_range=TASK1_VISUALIZATION_Y_RANGE,
+                height_range=TASK1_VISUALIZATION_HEIGHT_RANGE,
+                object_offsets=TASK1_VISUALIZATION_OBJECT_OFFSETS,
+                object_regions=TASK1_VISUALIZATION_OBJECT_REGIONS,
+                offset_frame=TASK1_OFFSET_FRAME,
+            )
+            task_visualization_updater = lambda: update_task1_visualization(env)
+        except Exception as e:
+            print(f"[Warning] task1 visualization init failed: {e}")
+    elif args_cli.enable_visualization and task_name == "task2":
+        try:
+            from leisaac.tasks.task2.mdp.observations import init_task2_visualization, update_task2_visualization
+            from leisaac.tasks.task2.xtrainer_pickup_recognition_env_cfg import (
+                TASK2_VISUALIZATION_CONTAINER_NAME,
+                TASK2_VISUALIZATION_OBJECT_NAMES,
+                TASK2_VISUALIZATION_X_RANGE,
+                TASK2_VISUALIZATION_Y_RANGE,
+                TASK2_VISUALIZATION_HEIGHT_RANGE,
+                TASK2_VISUALIZATION_OBJECT_OFFSETS,
+                TASK2_VISUALIZATION_OBJECT_REGIONS,
+                TASK2_VISUALIZATION_OBJECT_REGION_MAP,
+                TASK2_OFFSET_FRAME,
+            )
+
+            init_task2_visualization(
+                env=env,
+                container_name=TASK2_VISUALIZATION_CONTAINER_NAME,
+                object_names=TASK2_VISUALIZATION_OBJECT_NAMES,
+                x_range=TASK2_VISUALIZATION_X_RANGE,
+                y_range=TASK2_VISUALIZATION_Y_RANGE,
+                height_range=TASK2_VISUALIZATION_HEIGHT_RANGE,
+                object_offsets=TASK2_VISUALIZATION_OBJECT_OFFSETS,
+                object_regions=TASK2_VISUALIZATION_OBJECT_REGIONS,
+                object_region_map=TASK2_VISUALIZATION_OBJECT_REGION_MAP,
+                offset_frame=TASK2_OFFSET_FRAME,
+                apply_object_scale=True,
+            )
+            task_visualization_updater = lambda: update_task2_visualization(env)
+        except Exception as e:
+            print(f"[Warning] task2 visualization init failed: {e}")
+    elif args_cli.enable_visualization and task_name == "task3":
+        try:
+            from leisaac.tasks.task3.mdp.observations import init_task3_visualization, update_task3_visualization
+            from leisaac.tasks.task3.xtrainer_pickup_recognition_env_cfg import (
+                TASK3_VISUALIZATION_CONTAINER_NAME,
+                TASK3_VISUALIZATION_OBJECT_NAMES,
+                TASK3_VISUALIZATION_X_RANGE,
+                TASK3_VISUALIZATION_Y_RANGE,
+                TASK3_VISUALIZATION_HEIGHT_RANGE,
+                TASK3_VISUALIZATION_OBJECT_OFFSETS,
+                TASK3_VISUALIZATION_OBJECT_REGIONS,
+                TASK3_VISUALIZATION_OBJECT_REGION_MAP,
+                TASK3_OFFSET_FRAME,
+            )
+
+            init_task3_visualization(
+                env=env,
+                container_name=TASK3_VISUALIZATION_CONTAINER_NAME,
+                object_names=TASK3_VISUALIZATION_OBJECT_NAMES,
+                x_range=TASK3_VISUALIZATION_X_RANGE,
+                y_range=TASK3_VISUALIZATION_Y_RANGE,
+                height_range=TASK3_VISUALIZATION_HEIGHT_RANGE,
+                object_offsets=TASK3_VISUALIZATION_OBJECT_OFFSETS,
+                object_regions=TASK3_VISUALIZATION_OBJECT_REGIONS,
+                object_region_map=TASK3_VISUALIZATION_OBJECT_REGION_MAP,
+                offset_frame=TASK3_OFFSET_FRAME,
+                apply_object_scale=True,
+            )
+            task_visualization_updater = lambda: update_task3_visualization(env)
+        except Exception as e:
+            print(f"[Warning] task3 visualization init failed: {e}")
+
+    if args_cli.teleop_device == "xtrainer_vr":
+        stereo_left_sensor = env.unwrapped.scene["stereo_left"]
+        stereo_right_sensor = env.unwrapped.scene["stereo_right"]
+
+    if args_cli.multi_view:
+        try:
+            import omni.kit.viewport.utility
+            import omni.ui
+            
+            robot_base_path = "/World/envs/env_0/Robot/x_trainer_asm_0226_SLDASM"
+            cameras_config = {
+                "Top_View": f"{robot_base_path}/base_link/top_camera",
+                "Left_Wrist_View": f"{robot_base_path}/J1_6/left_wrist_camera",
+                "Right_Wrist_View": f"{robot_base_path}/J2_6/right_wrist_camera"
+            }
+
+            for win_name, cam_path in cameras_config.items():
+                vp_win = omni.kit.viewport.utility.create_viewport_window(win_name)
+                if vp_win:
+                    vp_win.viewport_api.camera_path = cam_path
+                    
+        except Exception as e:
+            print(f"[Warning] Setup error: {e}")
+
+
+    resume_recorded_demo_count = 0
+    if args_cli.record and args_cli.resume:
+        resume_recorded_demo_count = env.recorder_manager._dataset_file_handler.get_num_episodes()
+        print(f"Resume recording from existing dataset file with {resume_recorded_demo_count} demonstrations.")
+    current_recorded_demo_count = resume_recorded_demo_count
+
+    start_record_state = False
+    
+    ui_frame_count = 0
+    layout_done = False
+    # simulate environment
+    while simulation_app.is_running():
+        ui_frame_count += 1
+        
+        # Wait until frame 60 before executing the layout to ensure the UI is fully ready
+        if args_cli.multi_view and not layout_done and ui_frame_count == 60:
+            try:
+                import omni.ui
+                top_win = omni.ui.Workspace.get_window("Top_View")
+                left_win = omni.ui.Workspace.get_window("Left_Wrist_View")
+                right_win = omni.ui.Workspace.get_window("Right_Wrist_View")
+                
+                main_dock_space = omni.ui.Workspace.get_window("Viewport")
+                
+                if top_win and left_win and right_win and main_dock_space:
+                    print("Executing Custom Layout Docking...")
+
+                    top_win.dock_in(main_dock_space, omni.ui.DockPosition.SAME)
+                    left_win.dock_in(top_win, omni.ui.DockPosition.BOTTOM, ratio=0.4)
+                    right_win.dock_in(left_win, omni.ui.DockPosition.RIGHT, ratio=0.5)
+                    
+                    top_win.visible = True
+                    left_win.visible = True
+                    right_win.visible = True
+                    
+                    print(">>> Windows docked successfully!")
+                    layout_done = True
+                else:
+                    print(f"Waiting for windows... (Main: {main_dock_space is not None})")
+                    
+            except Exception as e:
+                print(f"Layout failed: {e}")
+                layout_done = True
+
+        # run everything in inference mode
+        with torch.inference_mode():
+            if env.cfg.dynamic_reset_gripper_effort_limit:
+                dynamic_reset_gripper_effort_limit_sim(env, args_cli.teleop_device)
+            actions = teleop_interface.advance()
+            if should_reset_task_success:
+                print("Task Success!!!")
+                should_reset_task_success = False
+                if args_cli.record:
+                    manual_terminate(env, True)
+            if should_reset_recording_instance:
+                env.reset()
+                should_reset_recording_instance = False
+                if start_record_state:
+                    if args_cli.record:
+                        print("Stop Recording!!!")
+                    start_record_state = False
+                if args_cli.record:
+                    manual_terminate(env, False)
+                # print out the current demo count if it has changed
+                if args_cli.record and env.recorder_manager.exported_successful_episode_count + resume_recorded_demo_count > current_recorded_demo_count:
+                    current_recorded_demo_count = env.recorder_manager.exported_successful_episode_count + resume_recorded_demo_count
+                    print(f"Recorded {current_recorded_demo_count} successful demonstrations.")
+                if args_cli.record and args_cli.num_demos > 0 and env.recorder_manager.exported_successful_episode_count + resume_recorded_demo_count >= args_cli.num_demos:
+                    print(f"All {args_cli.num_demos} demonstrations recorded. Exiting the app.")
+                    break
+
+                if args_cli.teleop_device == "xtrainer_vr":
+                    env.sim.render()
+
+            elif actions is None:
+                env.render()
+            # apply actions
+            else:
+                if not start_record_state:
+                    if args_cli.record:
+                        print("Start Recording!!!")
+                    start_record_state = True
+                env.step(actions)
+
+            
+            if args_cli.teleop_device == "xtrainer_vr":
+                try:
+                    img_l_raw = stereo_left_sensor.data.output["rgb"][0]
+                    img_r_raw = stereo_right_sensor.data.output["rgb"][0]
+                    sbs_tensor = torch.cat([img_l_raw, img_r_raw], dim=1)
+                    
+                    sbs_img = sbs_tensor.cpu().numpy().astype(np.uint8)
+                    sbs_img_bgr = cv2.cvtColor(sbs_img, cv2.COLOR_RGB2BGR)
+                    
+                    ret, buffer = cv2.imencode('.jpg', sbs_img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                    
+                    if ret:
+                        frame_bytes = buffer.tobytes()
+                        if not image_queue.full():
+                            image_queue.put_nowait(frame_bytes)
+                        else:
+                            try:
+                                image_queue.get_nowait()
+                                image_queue.put_nowait(frame_bytes)
+                            except:
+                                pass
+                except Exception as e:
+                    print(f"Vision error: {e}")
+
+            if task_visualization_updater is not None:
+                try:
+                    task_visualization_updater()
+                except Exception as e:
+                    print(f"[Warning] visualization update failed: {e}")
+                    task_visualization_updater = None
+
+            if rate_limiter:
+                rate_limiter.sleep(env)
+
+    # close the simulator
+    env.close()
+    simulation_app.close()
+
+if __name__ == "__main__":
+    # run the main function
+    main()
